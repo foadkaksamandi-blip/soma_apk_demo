@@ -1,0 +1,146 @@
+name: KargahYar QA APK v2
+
+on:
+  push:
+    branches: [kargahyar-release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  qa-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and validate PWA
+        run: |
+          set -euo pipefail
+          mkdir -p web
+          BASE='https://kargahyar-production.vercel.app'
+          curl --retry 6 --retry-all-errors --retry-delay 2 -fsSL "$BASE/" -o web/index.html
+          curl --retry 6 --retry-all-errors --retry-delay 2 -fsSL "$BASE/manifest.webmanifest" -o web/manifest.webmanifest
+          curl --retry 6 --retry-all-errors --retry-delay 2 -fsSL "$BASE/sw.js" -o web/sw.js
+          curl --retry 6 --retry-all-errors --retry-delay 2 -fsSL "$BASE/icon.svg" -o web/icon.svg
+          grep -q 'کارگاه‌یار' web/index.html
+          node --check web/sw.js
+          python3 - <<'PY'
+          import json,re
+          json.load(open('web/manifest.webmanifest',encoding='utf-8'))
+          html=open('web/index.html',encoding='utf-8').read()
+          blocks=re.findall(r'<script>(.*?)</script>',html,re.S)
+          assert blocks, 'application JavaScript not found'
+          open('/tmp/app.js','w',encoding='utf-8').write('\n'.join(blocks))
+          PY
+          node --check /tmp/app.js
+
+      - name: Real browser QA gate
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8765 --directory web >/tmp/http.log 2>&1 &
+          PID=$!
+          trap 'kill $PID || true' EXIT
+          for i in {1..30}; do curl -fsS http://127.0.0.1:8765/ >/dev/null && break || sleep 1; done
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          test -n "$CHROME"
+          timeout 150s "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --virtual-time-budget=90000 --dump-dom 'http://127.0.0.1:8765/?qa=1' > /tmp/qa.html
+          grep -q 'data-result="PASS"' /tmp/qa.html
+          echo 'KargahYar browser QA: PASS'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generate Android wrapper from QA-approved PWA
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/com/foad/kargahyar app/src/main/assets
+          cp web/index.html web/manifest.webmanifest web/sw.js web/icon.svg app/src/main/assets/
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name='KargahYar'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'com.foad.kargahyar'
+            compileSdk 35
+            defaultConfig {
+              applicationId 'com.foad.kargahyar'
+              minSdk 24
+              targetSdk 35
+              versionCode 100
+              versionName '1.0.0'
+            }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:theme="@android:style/Theme.Material.Light.NoActionBar" android:label="کارگاه‌یار" android:allowBackup="true" android:supportsRtl="true" android:usesCleartextTraffic="false">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/foad/kargahyar/MainActivity.java <<'EOF'
+          package com.foad.kargahyar;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          public class MainActivity extends Activity {
+            private WebView w;
+            @Override public void onCreate(Bundle b){super.onCreate(b);w=new WebView(this);setContentView(w);WebSettings s=w.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setDatabaseEnabled(true);s.setAllowFileAccess(true);s.setAllowContentAccess(true);w.setWebViewClient(new WebViewClient());w.setWebChromeClient(new WebChromeClient());w.loadUrl("file:///android_asset/index.html");}
+            @Override public void onBackPressed(){if(w!=null&&w.canGoBack())w.goBack();else super.onBackPressed();}
+            @Override protected void onDestroy(){if(w!=null){w.destroy();w=null;}super.onDestroy();}
+          }
+          EOF
+
+      - name: Build and verify installable APK
+        run: |
+          set -euo pipefail
+          gradle :app:assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk KargahYar-1.0.0.apk
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          "$BT/apksigner" verify --verbose KargahYar-1.0.0.apk
+          "$BT/aapt" dump badging KargahYar-1.0.0.apk | tee /tmp/badging.txt
+          grep -q "package: name='com.foad.kargahyar'" /tmp/badging.txt
+          test -s KargahYar-1.0.0.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KargahYar-1.0.0-APK
+          path: KargahYar-1.0.0.apk
+          retention-days: 30
+
+      - name: Publish public APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG='kargahyar-v1.0.0'
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title 'KargahYar 1.0.0' --notes 'QA-gated Android build generated from the production PWA.'
+          gh release upload "$TAG" KargahYar-1.0.0.apk --clobber
+          gh release view "$TAG" --json url,assets
